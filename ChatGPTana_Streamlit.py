@@ -325,11 +325,8 @@ def manual_chat_to_tana_paste(manual_text):
 
 st.title("ChatGPT to Tana Paste Converter")
 st.write(
-    "Upload your JSON file and convert it into Tana Paste.\n\n"
-    "This version merges all assistant/tool messages between user messages into one answer,\n"
-    "and splits the output by complete conversation nodes so that each file starts with the full conversation header\n"
-    "and ends with a complete #chatgptquestion block. If a conversation node is too long, it will be split by Q–A blocks,\n"
-    "with its header repeated in subsequent chunks."
+    "Upload your conversations.json file and convert all of your ChatGPT history into Tana Paste.\n\n"
+    "Or manually copy-paste a single conversation."
 )
 
 conversion_mode = st.radio("Select conversion mode:", ["JSON File", "Manual Chat"])
