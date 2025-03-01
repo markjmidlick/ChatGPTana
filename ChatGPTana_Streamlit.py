@@ -4,12 +4,14 @@ from datetime import datetime
 from io import BytesIO
 import zipfile
 import re
+import time
 
 ################################################################################
 # Configuration
 ################################################################################
 
-MAX_CHARS_PER_FILE = 80000    # Maximum characters per Tana Paste file chunk
+MAX_FILE_SIZE = 100000    # Maximum allowed characters per TXT file
+MIN_FILE_SIZE = 50000     # Aim: No more than one file should be under this (if mergeable)
 
 ################################################################################
 # Helper Functions
@@ -22,54 +24,63 @@ def convert_timestamp(ts):
     return datetime.fromtimestamp(ts).strftime('[[date:%Y-%m-%d %H:%M]]')
 
 def remove_extra_tana_tags(text):
-    """Remove occurrences of '%%tana%%' from text."""
+    """Remove any '%%tana%%' placeholders from the text."""
     return text.replace("%%tana%%", "")
 
-def format_multiline_for_tana(text, indent_level=6):
+def format_multiline_as_nodes(text, indent_level=8):
     """
-    Indent multiline text so Tana interprets it as nested lines.
-    Triple-backtick code blocks are preserved.
+    Split the given text into individual lines and output each as its own bullet node.
+    Each non-empty line becomes a node prefixed with "- ".
     """
-    lines = text.split("\n")
-    return "\n".join(" " * indent_level + line.strip() for line in lines if line.strip())
+    if not text:
+        return ""
+    lines = text.splitlines()
+    return "\n".join(" " * indent_level + "- " + line.strip() for line in lines if line.strip())
 
 def extract_text(msg):
     """
-    Extract and combine text from a message's 'parts'. 
-    If a part is a dict and has a "text" key (e.g. for audio transcriptions), that text is extracted.
-    Otherwise, the part is converted to a string.
+    Extract and combine text from a message's 'parts'.
+    If a part is a dict and has a "text" key (e.g. for audio transcriptions),
+    that text is used; otherwise, the part is stringified.
     """
-    parts = msg.get("content", {}).get("parts", [])
-    extracted = []
-    for part in parts:
-        if isinstance(part, dict):
-            if "text" in part:
-                extracted.append(part["text"])
+    try:
+        parts = msg.get("content", {}).get("parts", [])
+        extracted = []
+        for part in parts:
+            if isinstance(part, dict):
+                extracted.append(part.get("text", str(part)))
             else:
                 extracted.append(str(part))
-        else:
-            extracted.append(str(part))
-    return remove_extra_tana_tags(" ".join(extracted)).strip()
+        return remove_extra_tana_tags(" ".join(extracted)).strip()
+    except Exception as e:
+        st.error(f"Error extracting text: {str(e)}")
+        return ""
 
 ################################################################################
-# Merged JSON -> Tana Paste Conversion (Fast Merging)
+# Conversion: Merge Q–A Blocks
 ################################################################################
 
-def json_to_tana_paste_merged_fast(json_data):
-    out_lines = []
-    out_lines.append("%%tana%%")
-    out_lines.append("")  # blank line
-
-    for conv in json_data:
+def json_to_tana_paste_merged_fast(json_data, progress_bar=None):
+    """
+    Merge consecutive assistant/tool messages after a user message into one Q–A block.
+    Each line in the question and answer becomes its own bullet node.
+    """
+    out_lines = ["%%tana%%", ""]
+    total_convs = len(json_data)
+    for i, conv in enumerate(json_data):
+        if progress_bar:
+            progress_bar.progress((i+1)/total_convs)
+            
         title = conv.get("title", "No Title")
         ctime = conv.get("create_time")
         utime = conv.get("update_time")
         mapping = conv.get("mapping", {})
 
         # Build conversation header
-        conv_header = []
-        conv_header.append(f"- {title} #chatgpt")
-        conv_header.append(f"  - Title:: {title}")
+        conv_header = [
+            f"- {title} #chatgpt",
+            f"  - Title:: {title}"
+        ]
         if ctime:
             conv_header.append(f"  - Created Time:: {convert_timestamp(ctime)}")
         if utime:
@@ -77,9 +88,9 @@ def json_to_tana_paste_merged_fast(json_data):
         conv_header.append("  - Chat::")
         conv_header_text = "\n".join(conv_header)
         out_lines.append(conv_header_text)
-        out_lines.append("")  # blank line
+        out_lines.append("")
 
-        # Gather and sort messages
+        # Gather and sort messages by creation time
         messages = []
         for node in mapping.values():
             msg = node.get("message")
@@ -88,75 +99,62 @@ def json_to_tana_paste_merged_fast(json_data):
         messages.sort(key=lambda m: m.get("create_time") or 0)
 
         pending_user = None
-        assistant_buffer = []  # accumulate all assistant/tool texts for current Q–A block
+        assistant_buffer = []
 
         def finalize_qa():
             nonlocal pending_user, assistant_buffer
             if pending_user and assistant_buffer:
                 user_text = extract_text(pending_user)
-                # Check if user text is wrapped in quotes => voice
-                was_quoted = ((user_text.startswith("“") and user_text.endswith("”")) or
-                              (user_text.startswith('"') and user_text.endswith('"')))
-                if was_quoted:
+                quoted = (user_text.startswith(("“", '"')) and user_text.endswith(("”", '"')))
+                if quoted:
                     user_text = user_text[1:-1].strip()
-                chat_type = "voice" if was_quoted else "text"
+                chat_type = "voice" if quoted else "text"
                 q_time = pending_user.get("create_time")
-                q_time_formatted = convert_timestamp(q_time) if q_time else ""
+                q_time_str = convert_timestamp(q_time) if q_time else ""
                 merged_answer = "\n".join(assistant_buffer).strip()
-
                 out_lines.append("    - #chatgptquestion")
                 out_lines.append("      - question::")
-                for line in format_multiline_for_tana(user_text, indent_level=8).splitlines():
-                    out_lines.append(line)
-                if q_time_formatted:
+                out_lines.append(format_multiline_as_nodes(user_text, indent_level=8))
+                if q_time_str:
                     if chat_type == "voice":
-                        out_lines.append(f"      - audio_length:: {q_time_formatted}")
+                        out_lines.append(f"      - audio_length:: {q_time_str}")
                     else:
-                        out_lines.append(f"      - question_time:: {q_time_formatted}")
+                        out_lines.append(f"      - question_time:: {q_time_str}")
                 out_lines.append(f"      - chat_type:: {chat_type}")
                 out_lines.append("      - answer::")
-                for line in format_multiline_for_tana(merged_answer, indent_level=8).splitlines():
-                    out_lines.append(line)
-                out_lines.append("")  # blank line for separation
-
+                out_lines.append(format_multiline_as_nodes(merged_answer, indent_level=8))
+                out_lines.append("")
                 pending_user = None
-                assistant_buffer = []
+                assistant_buffer.clear()
 
         for msg in messages:
             role = msg.get("author", {}).get("role", "")
             text = extract_text(msg)
             if not text:
                 continue
-
             if role == "user":
-                finalize_qa()  # finalize previous pairing if exists
+                finalize_qa()
                 pending_user = msg
-                assistant_buffer = []
+                assistant_buffer.clear()
             elif role in ("assistant", "tool"):
                 if pending_user:
                     assistant_buffer.append(text)
                 else:
                     out_lines.append("    - ChatGPT::")
-                    for line in format_multiline_for_tana(text, indent_level=8).splitlines():
-                        out_lines.append(line)
+                    out_lines.append(format_multiline_as_nodes(text, indent_level=8))
             else:
                 continue
-
-        finalize_qa()  # finalize any leftover pairing for this conversation
-        out_lines.append("")  # blank line between conversations
-
+        finalize_qa()
+        out_lines.append("")
     return "\n".join(out_lines)
 
 ################################################################################
-# Splitting by Complete Conversation Nodes
+# Splitting: Conversation Node Level
 ################################################################################
 
 def split_conversation_by_qna(conv_text, max_chars):
     """
-    Split a single conversation node into chunks by complete Q–A block boundaries.
-    The conversation node is assumed to have a header (everything up to and including "  - Chat::")
-    and then Q–A blocks starting with "    - #chatgptquestion".
-    Each chunk will re‑include the header.
+    Split a single conversation node by complete Q–A block boundaries.
     """
     lines = conv_text.splitlines()
     header_lines = []
@@ -169,7 +167,8 @@ def split_conversation_by_qna(conv_text, max_chars):
             if "  - Chat::" in line:
                 header_found = True
         else:
-            if line.strip().startswith("- #chatgptquestion") or line.strip().startswith("    - #chatgptquestion"):
+            if (line.strip().startswith("- #chatgptquestion") or 
+                line.strip().startswith("    - #chatgptquestion")):
                 if current_qna:
                     qna_blocks.append("\n".join(current_qna))
                     current_qna = []
@@ -181,11 +180,11 @@ def split_conversation_by_qna(conv_text, max_chars):
     chunks = []
     current_chunk = []
     current_length = len(header_text) + 2  # header plus two newlines
-    def finalize_chunk(chunk_lines):
-        return header_text + "\n\n" + "\n\n".join(chunk_lines)
+    def finalize_chunk(chunk_list):
+        return header_text + "\n\n" + "\n\n".join(chunk_list)
     
     for block in qna_blocks:
-        block_len = len(block) + 2  # plus separating newlines
+        block_len = len(block) + 2
         if current_length + block_len > max_chars and current_chunk:
             chunks.append(finalize_chunk(current_chunk))
             current_chunk = []
@@ -196,84 +195,99 @@ def split_conversation_by_qna(conv_text, max_chars):
         chunks.append(finalize_chunk(current_chunk))
     return chunks
 
-def split_tana_by_conversations(tana_text, max_chars=MAX_CHARS_PER_FILE):
+def split_tana_by_conversations(tana_text, max_chars):
     """
-    Split the full Tana Paste output into chunks by complete conversation nodes.
-    If a conversation node exceeds max_chars, split it further by complete Q–A blocks
-    (using split_conversation_by_qna), ensuring that each chunk ends with a complete #chatgptquestion block.
-    Each final chunk is prefixed with "%%tana%%" on its own line.
+    Split the full Tana Paste output into chunks at conversation boundaries,
+    splitting further by Q–A block boundaries if needed.
+    Each chunk is prefixed with "%%tana%%".
     """
     overall_header = "%%tana%%\n\n"
-    if tana_text.startswith(overall_header):
-        body = tana_text[len(overall_header):]
-    else:
-        body = tana_text
-
-    # Split by conversation nodes (each conversation node starts with a line beginning with "- ")
-    convos = body.split("\n\n- ")
+    body = tana_text[len(overall_header):] if tana_text.startswith(overall_header) else tana_text
+    convos = re.split(r'\n\n- ', body)
     if convos:
-        convos = [convos[0]] + ["- " + convo for convo in convos[1:]]
+        convos = [convos[0]] + ["- " + c for c in convos[1:]]
     else:
         convos = []
-
+    
     chunks = []
     current_chunk = []
-    current_length = 0
-
+    current_length = len(overall_header)
+    
     def finalize_chunk(chunk_list):
         return overall_header + "\n\n".join(chunk_list)
-
+    
     for convo in convos:
-        if len(convo) > max_chars:
-            subchunks = split_conversation_by_qna(convo, max_chars)
+        if len(convo) + len(overall_header) > max_chars:
+            if current_chunk:
+                chunks.append(finalize_chunk(current_chunk))
+                current_chunk = []
+                current_length = len(overall_header)
+            subchunks = split_conversation_by_qna(overall_header + convo, max_chars)
             for sub in subchunks:
-                extra = 2 if current_chunk else 0
-                if current_length + len(sub) + extra > max_chars and current_chunk:
-                    chunks.append(finalize_chunk(current_chunk))
-                    current_chunk = []
-                    current_length = 0
-                current_chunk.append(sub)
-                current_length += len(sub) + extra
-            continue
-        extra = 2 if current_chunk else 0
-        if current_length + len(convo) + extra > max_chars and current_chunk:
-            chunks.append(finalize_chunk(current_chunk))
-            current_chunk = []
-            current_length = 0
-        current_chunk.append(convo)
-        current_length += len(convo) + extra
-
+                if len(sub) > max_chars:
+                    st.warning("A conversation chunk exceeds maximum file size; this Q–A block may be too large.")
+                chunks.append(sub)
+        else:
+            extra = 2 if current_chunk else 0
+            if current_length + len(convo) + extra > max_chars and current_chunk:
+                chunks.append(finalize_chunk(current_chunk))
+                current_chunk = []
+                current_length = len(overall_header)
+                extra = 0
+            current_chunk.append(convo)
+            current_length += len(convo) + extra
+    
     if current_chunk:
         chunks.append(finalize_chunk(current_chunk))
     return chunks
 
 ################################################################################
-# Fallback Line-by-Line Splitter (if needed)
+# Best-Fit Decreasing Merging (Bin-Packing Approach)
 ################################################################################
 
-def split_tana_paste(tana_text, max_chars=MAX_CHARS_PER_FILE):
-    lines = tana_text.splitlines()
-    if lines and lines[0].strip() == "%%tana%%":
-        lines = lines[1:]
-    chunks = []
-    current_chunk = []
-    current_length = 0
-    def finalize(chunk_lines):
-        return "%%tana%%\n\n" + "\n".join(chunk_lines).strip()
-    for line in lines:
-        line_len = len(line) + 1
-        if current_length + line_len > max_chars and current_chunk:
-            chunks.append(finalize(current_chunk))
-            current_chunk = []
-            current_length = 0
-        current_chunk.append(line)
-        current_length += line_len
-    if current_chunk:
-        chunks.append(finalize(current_chunk))
-    return chunks
+def best_fit_decreasing(chunks, max_chars=MAX_FILE_SIZE):
+    """
+    Merge chunks using a best-fit decreasing strategy.
+    
+    Sort chunks from largest to smallest, then for each chunk,
+    place it in the bin with the smallest remaining capacity that can fit it.
+    """
+    prefix = "%%tana%%\n\n"
+    # Remove the prefix from each chunk for bin packing; we'll add it back later.
+    chunk_info = []
+    for chunk in chunks:
+        if chunk.startswith(prefix):
+            content = chunk[len(prefix):]
+        else:
+            content = chunk
+        chunk_info.append((content, len(content)))
+    
+    # Sort by descending size
+    chunk_info.sort(key=lambda x: x[1], reverse=True)
+    
+    bins = []  # each bin is a tuple (content, used_size)
+    
+    for content, size in chunk_info:
+        best_bin_index = -1
+        best_leftover = max_chars + 1
+        for i, (bin_content, used) in enumerate(bins):
+            leftover = max_chars - used
+            if size + 2 <= leftover:  # 2 for newline separator
+                if leftover - (size + 2) < best_leftover:
+                    best_leftover = leftover - (size + 2)
+                    best_bin_index = i
+        if best_bin_index >= 0:
+            bin_text, bin_used = bins[best_bin_index]
+            new_text = bin_text + "\n\n" + content
+            bins[best_bin_index] = (new_text, bin_used + size + 2)
+        else:
+            bins.append((content, size))
+    
+    final_chunks = [prefix + b[0] for b in bins]
+    return final_chunks
 
 ################################################################################
-# Manual Chat Conversion (Unchanged)
+# Manual Chat Conversion
 ################################################################################
 
 def manual_chat_to_tana_paste(manual_text):
@@ -311,64 +325,107 @@ def manual_chat_to_tana_paste(manual_text):
                 continue
             processed_a.append(line)
         answer_text = "\n".join(processed_a).strip()
-        tana += f"- #chatgptquestion\n"
-        tana += "  - question::\n" + format_multiline_for_tana(question_text, indent_level=6) + "\n"
+        tana += "- #chatgptquestion\n"
+        tana += "  - question::\n" + format_multiline_as_nodes(question_text, indent_level=6) + "\n"
         if question_time:
             tana += f"  - question_time:: {question_time}\n"
         tana += "  - chat_type:: text\n"
-        tana += "  - answer::\n" + format_multiline_for_tana(answer_text, indent_level=6) + "\n\n"
+        tana += "  - answer::\n" + format_multiline_as_nodes(answer_text, indent_level=6) + "\n\n"
     return tana
+
+################################################################################
+# File Stats
+################################################################################
+
+def get_file_stats(files):
+    if not files:
+        return "No files generated"
+    total_size = sum(len(f) for f in files)
+    total_qna = sum(f.count("#chatgptquestion") for f in files)
+    avg = total_size / len(files)
+    stats = [
+        f"**Total Files**: {len(files)}",
+        f"**Total Size**: {total_size:,} characters",
+        f"**Total Q&A Pairs**: {total_qna}",
+        f"**Average File Size**: {avg:,.0f} characters"
+    ]
+    for i, f in enumerate(files):
+        qna_count = f.count("#chatgptquestion")
+        util = (len(f)/MAX_FILE_SIZE)*100
+        stats.append(f"- File {i+1}: {len(f):,} chars ({util:.1f}% full), {qna_count} Q&A pairs")
+    return "\n".join(stats)
 
 ################################################################################
 # Streamlit App
 ################################################################################
 
+st.set_page_config(page_title="ChatGPT to Tana Paste Converter", layout="wide")
 st.title("ChatGPT to Tana Paste Converter")
-st.write(
-    "Upload your conversations.json file and convert all of your ChatGPT history into Tana Paste.\n\n"
-    "Or manually copy-paste a single conversation."
-)
 
 conversion_mode = st.radio("Select conversion mode:", ["JSON File", "Manual Chat"])
 
 if conversion_mode == "JSON File":
     uploaded_file = st.file_uploader("Choose a JSON file", type="json")
-    raw_json_str = ""
-    if uploaded_file is not None:
-        raw_json_bytes = uploaded_file.read()
-        raw_json_str = raw_json_bytes.decode("utf-8", errors="replace")
-        # JSON preview removed per request.
-        json_data = json.loads(raw_json_str)
+    if uploaded_file:
+        raw_json_str = uploaded_file.read().decode("utf-8", errors="replace")
+        try:
+            json_data = json.loads(raw_json_str)
+            st.success(f"Loaded JSON with {len(json_data)} conversations.")
+        except Exception as e:
+            st.error(f"Error loading JSON: {e}")
     
     if st.button("Convert JSON"):
         if not raw_json_str.strip():
-            st.write("No JSON loaded or file is empty.")
+            st.error("No JSON loaded or file is empty.")
         else:
-            tana_text = json_to_tana_paste_merged_fast(json_data)
-            files = split_tana_by_conversations(tana_text, max_chars=MAX_CHARS_PER_FILE)
-            if files:
-                st.subheader("Preview of First Tana Paste File (After Conversion)")
-                st.text_area("Copy/Paste Preview (File 1)", value=files[0], height=400)
+            progress_bar = st.progress(0)
+            with st.spinner("Converting JSON..."):
+                tana_text = json_to_tana_paste_merged_fast(json_data, progress_bar)
+                progress_bar.progress(1.0)
+                time.sleep(0.5)
+            with st.spinner("Splitting into chunks..."):
+                initial_chunks = split_tana_by_conversations(tana_text, max_chars=MAX_FILE_SIZE)
+                final_files = best_fit_decreasing(initial_chunks, max_chars=MAX_FILE_SIZE)
+            if final_files:
+                st.subheader("Conversion Statistics")
+                st.markdown(get_file_stats(final_files))
+                preview_index = 0
+                if len(final_files) > 1:
+                    preview_index = st.selectbox("Select file to preview:", range(len(final_files)),
+                                                  format_func=lambda i: f"File {i+1} ({len(final_files[i]):,} chars)")
+                st.subheader("Preview of Selected File")
+                st.text_area("Preview", value=final_files[preview_index], height=400)
                 zip_buffer = BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-                    for i, content in enumerate(files):
-                        zipf.writestr(f"converted_tana_paste_part_{i+1}.txt", content)
-                st.write("Conversion Successful! Download the Tana Paste files below:")
-                st.download_button(
-                    label="Download Tana Paste ZIP",
-                    data=zip_buffer.getvalue(),
-                    file_name="converted_tana_paste.zip",
-                    mime="application/zip"
-                )
+                    for i, content in enumerate(final_files):
+                        fname = f"tana_part_{i+1}_{len(content)}chars.txt"
+                        zipf.writestr(fname, content)
+                st.download_button("Download ZIP", data=zip_buffer.getvalue(), file_name="tana_paste.zip", mime="application/zip")
             else:
-                st.write("No content found or empty after parsing.")
+                st.error("No content generated.")
+                
 elif conversion_mode == "Manual Chat":
-    manual_text = st.text_area("Paste your chat transcript here", height=400,
-                               help="Each Q–A pair is processed, with multiline support.")
+    manual_text = st.text_area("Paste your chat transcript here", height=400, help="Blocks with 'You said:' and 'ChatGPT said:' markers.")
     if st.button("Convert Manual Chat"):
         if not manual_text.strip():
-            st.write("Please paste some chat text first.")
+            st.error("Please paste some chat text first.")
         else:
             tana_text = manual_chat_to_tana_paste(manual_text)
-            st.subheader("Tana Paste Output")
-            st.text_area("Copy the Tana Paste below:", value=tana_text, height=400)
+            chunks = split_tana_paste(tana_text, max_chars=MAX_FILE_SIZE)
+            final_files = best_fit_decreasing(chunks, max_chars=MAX_FILE_SIZE)
+            if final_files:
+                st.subheader("Tana Paste Output Statistics")
+                st.markdown(get_file_stats(final_files))
+                st.subheader("Preview of First File")
+                st.text_area("Preview", value=final_files[0], height=400)
+                zbuf = BytesIO()
+                with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zipf:
+                    for i, fc in enumerate(final_files):
+                        fname = f"manual_tana_part_{i+1}_{len(fc)}chars.txt"
+                        zipf.writestr(fname, fc)
+                st.download_button("Download ZIP", data=zbuf.getvalue(), file_name="manual_tana_paste.zip", mime="application/zip")
+            else:
+                st.error("No valid content produced.")
+
+st.markdown("---")
+st.caption("Made by Mark J. Midlick (markjmidlick.com)")
