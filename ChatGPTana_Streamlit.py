@@ -56,14 +56,6 @@ def extract_text(msg):
 ################################################################################
 
 def json_to_tana_paste_merged_fast(json_data):
-    """
-    Convert JSON data to Tana Paste output by merging all consecutive assistant/tool
-    messages following a user message into one answer.
-    
-    Each user message (role="user") is paired with all following assistant/tool messages 
-    (until the next user message), and the output is accumulated in a list.
-    The answer_time field is omitted.
-    """
     out_lines = []
     out_lines.append("%%tana%%")
     out_lines.append("")  # blank line
